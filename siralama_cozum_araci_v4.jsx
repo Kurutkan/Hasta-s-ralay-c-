@@ -1,0 +1,476 @@
+import { useState, useMemo, useCallback, useRef } from "react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Legend, LineChart, Line, CartesianGrid, Cell } from "recharts";
+
+const COLORS = {FCFS:"#378ADD",SPT:"#1D9E75",LPT:"#D85A30",SVF:"#7F77DD",NSR:"#D4537E",HYB:"#BA7517"};
+const RULES = ["FCFS","SPT","LPT","SVF","NSR","HYB"];
+const RLBL = {FCFS:"Ilk gelen ilk alinir",SPT:"En kisa sure once",LPT:"En uzun sure once",SVF:"En kucuk varyans once",NSR:"En dusuk no-show riski once",HYB:"Agirlikli skor"};
+const TABS = ["Veri girisi","Siralama","Maliyet","No-show + OB","Performans","Senaryo","Sozluk","Sinirliliklar"];
+const PRESETS = [{id:"custom",l:"Ozel",cw:1,ci:2,co:3},{id:"poliklinik",l:"Poliklinik",cw:1,ci:1.5,co:4},{id:"cerrahi",l:"Cerrahi",cw:.5,ci:3,co:6},{id:"onkoloji",l:"Onkoloji",cw:2,ci:1,co:5}];
+
+const GLOSSARY = [
+  {k:"FCFS",t:"Ilk gelen ilk hizmet alir",e:"First Come First Served"},
+  {k:"SPT",t:"En kisa beklenen hizmet suresi once",e:"Shortest Processing Time first"},
+  {k:"LPT",t:"En uzun beklenen hizmet suresi once",e:"Longest Processing Time first"},
+  {k:"SVF",t:"En kucuk hizmet suresi varyansi once",e:"Smallest Variance First"},
+  {k:"NSR",t:"En dusuk no-show riski once",e:"No-Show Risk first (lowest q)"},
+  {k:"HYB",t:"Kullanici tanimli agirlikli skor",e:"Hybrid weighted composite score"},
+  {k:"s",t:"Paralel sunucu (hekim) sayisi",e:"Number of parallel servers"},
+  {k:"T",t:"Toplam klinik calisma suresi (dk)",e:"Total clinic duration (min)"},
+  {k:"d",t:"Standart randevu slot suresi (dk)",e:"Standard appointment slot (min)"},
+  {k:"st",t:"Beklenen ortalama hizmet suresi (dk)",e:"Expected mean service time (min)"},
+  {k:"sigma^2",t:"Hizmet suresi varyansi (dk^2). std=karekök(sigma^2)",e:"Service time variance (min^2)"},
+  {k:"q / ns",t:"Toplam gelmeme olasiligi (iptal + no-show)",e:"Total absence probability (cancel + no-show)"},
+  {k:"cw",t:"Hasta bekleme birim maliyeti (esikli)",e:"Tiered patient waiting cost per minute"},
+  {k:"ci",t:"Hekim bosta kalma birim maliyeti",e:"Physician idle cost per minute"},
+  {k:"co",t:"Fazla mesai birim maliyeti (esikli)",e:"Tiered overtime cost per minute"},
+  {k:"MC",t:"Monte Carlo — rassal tekrarlarla dagilim uretme",e:"Stochastic simulation via random replications"},
+  {k:"P50/P90",t:"Medyan / %90 yuzdelik dilim",e:"50th / 90th percentile of outcome distribution"},
+  {k:"OB",t:"Overbooking — no-show telafisi icin kapasite ustu kabul",e:"Accepting extra patients to offset no-shows"},
+  {k:"FM",t:"Fazla mesai — planlanan T'yi asan sure",e:"Overtime exceeding planned clinic hours"},
+  {k:"Walk-in",t:"Randevusuz basvuran hasta (Poisson sureci ile)",e:"Unscheduled patient (Poisson arrival process)"},
+  {k:"Punct.",t:"Zamanlama sapmasi — saga carpik dagilimla",e:"Arrival punctuality — right-skewed distribution"},
+  {k:"EDD",t:"En erken teslim zamani once (Event-Driven Dispatch)",e:"Earliest Due Date / Event-Driven Dispatch"},
+];
+
+function sampleLN(mu, v) {
+  if (v <= 0 || mu <= 0) return mu;
+  const s2 = Math.log(1 + v / (mu * mu)), m = Math.log(mu) - s2 / 2, s = Math.sqrt(s2);
+  let u1 = 0, u2 = 0; while (!u1) u1 = Math.random(); while (!u2) u2 = Math.random();
+  return Math.max(1, Math.exp(m + s * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2)));
+}
+function sampleGM(mu, v) {
+  if (v <= 0 || mu <= 0) return mu;
+  const k = mu * mu / v, th = v / mu;
+  if (k < 1) return sampleGM(mu + v / mu, v) * Math.pow(Math.random(), 1 / k);
+  const d = k - 1 / 3, c = 1 / Math.sqrt(9 * d);
+  while (true) {
+    let x, vv; do { let a = 0, b = 0; while (!a) a = Math.random(); while (!b) b = Math.random();
+    x = Math.sqrt(-2 * Math.log(a)) * Math.cos(2 * Math.PI * b); vv = (1 + c * x) ** 3; } while (vv <= 0);
+    const u = Math.random();
+    if (u < 1 - .0331 * x ** 4 || Math.log(u) < .5 * x * x + d * (1 - vv + Math.log(vv))) return Math.max(1, d * vv * th);
+  }
+}
+function sampleST(mu, v, dist) { return dist === "gamma" ? sampleGM(mu, v) : sampleLN(mu, v); }
+
+function samplePunctuality() {
+  let u1 = 0, u2 = 0; while (!u1) u1 = Math.random(); while (!u2) u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return Math.max(-10, Math.min(30, -2 + Math.exp(0.8 + 0.6 * z) - 2));
+}
+
+function sortByRule(pts, rule, w) {
+  const a = [...pts];
+  if (rule === "SPT") a.sort((x, y) => x.st - y.st);
+  else if (rule === "LPT") a.sort((x, y) => y.st - x.st);
+  else if (rule === "SVF") a.sort((x, y) => x.var - y.var);
+  else if (rule === "NSR") a.sort((x, y) => x.ns - y.ns);
+  else if (rule === "HYB") {
+    const ms = Math.max(...a.map(p => p.st)) || 1, mv = Math.max(...a.map(p => p.var)) || 1, mn = Math.max(...a.map(p => p.ns)) || 1;
+    a.sort((x, y) => {
+      const sx = w.st * (w.stDir * x.st / ms) + w.var * (w.varDir * x.var / mv) + w.ns * (w.nsDir * x.ns / mn);
+      const sy = w.st * (w.stDir * y.st / ms) + w.var * (w.varDir * y.var / mv) + w.ns * (w.nsDir * y.ns / mn);
+      return sx - sy;
+    });
+  }
+  return a;
+}
+
+function calcCost(waits, idleTotal, overtime, cw, ci, co, wTh1, wTh2, oTh1) {
+  const wCost = waits.reduce((s, x) => {
+    if (x <= wTh1) return s + cw * x;
+    if (x <= wTh2) return s + cw * wTh1 + cw * 1.5 * (x - wTh1);
+    return s + cw * wTh1 + cw * 1.5 * (wTh2 - wTh1) + cw * 3 * (x - wTh2);
+  }, 0);
+  const oCost = overtime <= oTh1 ? co * overtime : co * oTh1 + co * 2 * (overtime - oTh1);
+  return wCost + ci * idleTotal + oCost;
+}
+
+function runOnce(pts, rule, slot, T, cw, ci, co, w, stoch, dist, servers, walkInRate, wTh1, wTh2, oTh1, obSlots) {
+  const sorted = sortByRule(pts, rule, w);
+  const nS = Math.max(1, servers);
+  const sEnd = new Array(nS).fill(0);
+
+  const events = [];
+  sorted.forEach((p, i) => {
+    const absent = stoch ? Math.random() < p.ns : false;
+    const reason = absent ? (Math.random() < 0.3 ? "iptal" : "no-show") : null;
+    const punct = stoch && !absent ? samplePunctuality() : 0;
+    const scheduled = i * slot;
+    events.push({ ...p, scheduled, arrival: scheduled + punct, absent, reason, isWalkIn: false, isOB: p.isOB || false });
+  });
+
+  if (stoch && walkInRate > 0) {
+    let t = 0;
+    while (t < T) {
+      t += -Math.log(Math.random() || 1e-10) / (walkInRate / 60);
+      if (t < T) events.push({ id: "W" + (events.filter(e => e.isWalkIn).length + 1), st: 20 + Math.round(Math.random() * 20), var: 25, ns: 0, type: "Walk-in", scheduled: Math.round(t), arrival: Math.round(t), absent: false, reason: null, isWalkIn: true, isOB: false });
+    }
+  }
+
+  events.sort((a, b) => {
+    if (a.absent && !b.absent) return 1;
+    if (!a.absent && b.absent) return -1;
+    if (a.absent && b.absent) return a.scheduled - b.scheduled;
+    return a.arrival - b.arrival;
+  });
+
+  let totalWait = 0, totalIdle = 0, attended = 0;
+  const waits = [], details = [];
+
+  events.forEach(ev => {
+    if (ev.absent) {
+      details.push({ id: ev.id, show: false, reason: ev.reason, st: 0, wait: 0, idle: 0, start: 0, end: 0, server: -1, type: ev.type });
+      return;
+    }
+    attended++;
+    const actualSt = stoch ? sampleST(ev.st, ev.var, dist) : ev.st;
+    let bestS = 0, minEnd = sEnd[0];
+    for (let s = 1; s < nS; s++) { if (sEnd[s] < minEnd) { minEnd = sEnd[s]; bestS = s; } }
+    const start = Math.max(minEnd, ev.arrival);
+    const wait = Math.max(0, minEnd - ev.arrival);
+    const idle = Math.max(0, ev.arrival - minEnd);
+    totalWait += wait; totalIdle += idle; waits.push(wait);
+    const end = start + actualSt;
+    sEnd[bestS] = end;
+    details.push({ id: ev.id, show: true, reason: null, st: Math.round(actualSt), wait: Math.round(wait), idle: Math.round(idle), start: Math.round(start), end: Math.round(end), server: bestS, type: ev.type || "?", isWalkIn: ev.isWalkIn, isOB: ev.isOB });
+  });
+
+  const maxEnd = Math.max(...sEnd, 0);
+  const overtime = Math.max(0, maxEnd - T);
+  const avgWait = attended > 0 ? totalWait / attended : 0;
+  const maxWait = waits.length > 0 ? Math.max(...waits) : 0;
+  const totalSt = details.filter(d => d.show).reduce((s, d) => s + d.st, 0);
+  const realUtil = attended > 0 ? totalSt / (nS * Math.max(maxEnd, T)) : 0;
+  const waitStd = waits.length > 1 ? Math.sqrt(waits.reduce((s, x) => s + (x - avgWait) ** 2, 0) / waits.length) : 0;
+  const cost = calcCost(waits, totalIdle, overtime, cw, ci, co, wTh1, wTh2, oTh1);
+  return { maxEnd, totalWait, totalIdle, overtime, avgWait, maxWait, realUtil, waitStd, cost, attended, details, waits, walkInCount: events.filter(e => e.isWalkIn).length };
+}
+
+function runMC(pts, rule, slot, T, cw, ci, co, w, dist, servers, walkIn, N, wTh1, wTh2, oTh1, obSlots) {
+  const rs = []; for (let i = 0; i < N; i++) rs.push(runOnce(pts, rule, slot, T, cw, ci, co, w, true, dist, servers, walkIn, wTh1, wTh2, oTh1, obSlots));
+  const pct = (arr, p) => arr[Math.min(Math.floor(arr.length * p), arr.length - 1)];
+  const costs = rs.map(r => r.cost).sort((a, b) => a - b);
+  const ws = rs.map(r => r.avgWait).sort((a, b) => a - b);
+  const ots = rs.map(r => r.overtime).sort((a, b) => a - b);
+  return { avgCost: rs.reduce((s, r) => s + r.cost, 0) / N, p50Cost: pct(costs, .5), p90Cost: pct(costs, .9),
+    avgWait: rs.reduce((s, r) => s + r.avgWait, 0) / N, p50Wait: pct(ws, .5), p90Wait: pct(ws, .9),
+    avgOT: rs.reduce((s, r) => s + r.overtime, 0) / N, p90OT: pct(ots, .9),
+    avgAtt: rs.reduce((s, r) => s + r.attended, 0) / N, avgUtil: rs.reduce((s, r) => s + r.realUtil, 0) / N,
+    avgStd: rs.reduce((s, r) => s + r.waitStd, 0) / N, avgWI: rs.reduce((s, r) => s + r.walkInCount, 0) / N };
+}
+
+const defPts = [
+  {id:1,st:25,var:16,ns:.10,type:"Kronik"},{id:2,st:35,var:49,ns:.20,type:"Yeni"},
+  {id:3,st:20,var:9,ns:.05,type:"Kontrol"},{id:4,st:40,var:100,ns:.25,type:"Yeni"},
+  {id:5,st:30,var:25,ns:.15,type:"Kronik"},{id:6,st:15,var:9,ns:.08,type:"Kontrol"},
+  {id:7,st:45,var:144,ns:.30,type:"Yeni"},{id:8,st:28,var:16,ns:.12,type:"Kronik"},
+  {id:9,st:22,var:9,ns:.10,type:"Kontrol"},{id:10,st:38,var:64,ns:.18,type:"Yeni"},
+  {id:11,st:32,var:36,ns:.15,type:"Kronik"},{id:12,st:27,var:16,ns:.10,type:"Kontrol"},
+];
+
+function Gantt({ details, T, rule, servers }) {
+  const shown = details.filter(d => d.show);
+  const maxTime = Math.max(T, ...shown.map(d => d.end), 1);
+  return (<div style={{ minWidth: 400 }}>
+    {details.map((d, i) => (<div key={i} style={{ display: "flex", alignItems: "center", gap: 6, height: 20, marginBottom: 1 }}>
+      <span style={{ fontSize: 9, width: 28, textAlign: "right", flexShrink: 0, color: d.show ? "var(--color-text-secondary)" : "var(--color-text-tertiary)", textDecoration: d.show ? "none" : "line-through" }}>{typeof d.id === "string" ? d.id : "H" + d.id}</span>
+      <div style={{ position: "relative", flex: 1, height: 16 }}>
+        {d.show ? (<>
+          {d.wait > 0 && <div style={{ position: "absolute", left: `${Math.max(0, d.start - d.wait) / maxTime * 100}%`, width: `${d.wait / maxTime * 100}%`, height: "100%", background: "#F09595", borderRadius: 2, opacity: .4 }} />}
+          <div style={{ position: "absolute", left: `${d.start / maxTime * 100}%`, width: `${Math.max(d.st, 1) / maxTime * 100}%`, height: "100%", background: d.isWalkIn ? "#BA7517" : d.isOB ? "#D4537E" : COLORS[rule], borderRadius: 2, display: "flex", alignItems: "center", justifyContent: "center", opacity: servers > 1 ? (.55 + .45 * (1 - d.server / servers)) : 1 }}>
+            <span style={{ fontSize: 8, color: "#fff", fontWeight: 500 }}>{d.st}{servers > 1 ? " S" + (d.server + 1) : ""}</span>
+          </div>
+        </>) : (<div style={{ height: "100%", width: 32, background: "var(--color-border-tertiary)", borderRadius: 2, opacity: .3, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontSize: 7, color: "var(--color-text-tertiary)" }}>{d.reason}</span></div>)}
+      </div>
+    </div>))}
+    <div style={{ position: "relative", height: 10, marginLeft: 34, borderTop: "0.5px solid var(--color-border-tertiary)", marginTop: 3 }}>
+      <div style={{ position: "absolute", left: `${T / maxTime * 100}%`, top: -6, width: 1, height: 6, background: "#E24B4A" }} />
+      <span style={{ position: "absolute", left: `${T / maxTime * 100}%`, top: 1, fontSize: 8, color: "#E24B4A", transform: "translateX(-50%)" }}>T={T}</span>
+    </div>
+  </div>);
+}
+
+export default function App() {
+  const [tab, setTab] = useState(0);
+  const [pts, setPts] = useState(defPts);
+  const [T, setT] = useState(480);
+  const [slot, setSlot] = useState(30);
+  const [cw, setCw] = useState(1); const [ci, setCi] = useState(2); const [co, setCo] = useState(3);
+  const [servers, setServers] = useState(1);
+  const [dist, setDist] = useState("lognormal");
+  const [walkIn, setWalkIn] = useState(0);
+  const [nRuns, setNRuns] = useState(500);
+  const [activeRule, setActiveRule] = useState("SPT");
+  const [hybW, setHybW] = useState({ st: .4, var: .3, ns: .3, stDir: 1, varDir: 1, nsDir: 1 });
+  const [wTh1, setWTh1] = useState(15); const [wTh2, setWTh2] = useState(30); const [oTh1, setOTh1] = useState(15);
+  const [preset, setPreset] = useState("custom");
+  const [mcData, setMcData] = useState(null);
+  const [mcRunning, setMcRunning] = useState(false);
+  const mcRef = useRef(0);
+
+  const applyPreset = useCallback(id => { setPreset(id); const p = PRESETS.find(x => x.id === id); if (p && id !== "custom") { setCw(p.cw); setCi(p.ci); setCo(p.co); } }, []);
+  const updatePt = useCallback((i, f, raw) => { setPts(prev => prev.map((p, j) => { if (j !== i) return p; if (f === "type") return { ...p, type: raw }; const v = parseFloat(raw); return isNaN(v) ? p : { ...p, [f]: f === "ns" ? Math.max(0, Math.min(1, v / 100)) : Math.max(f === "var" ? 0 : 1, v) }; })); }, []);
+  const addPt = useCallback(() => setPts(p => [...p, { id: p.length + 1, st: 30, var: 25, ns: .15, type: "Yeni" }]), []);
+  const rmPt = useCallback(i => setPts(p => p.filter((_, j) => j !== i).map((x, j) => ({ ...x, id: j + 1 }))), []);
+
+  const stochDemo = useMemo(() => runOnce(pts, activeRule, slot, T, cw, ci, co, hybW, true, dist, servers, walkIn, wTh1, wTh2, oTh1), [pts, activeRule, slot, T, cw, ci, co, hybW, dist, servers, walkIn, wTh1, wTh2, oTh1]);
+
+  const runSimulation = useCallback(() => {
+    setMcRunning(true);
+    const id = ++mcRef.current;
+    setTimeout(() => {
+      const m = {};
+      RULES.forEach(r => { m[r] = runMC(pts, r, slot, T, cw, ci, co, hybW, dist, servers, walkIn, nRuns, wTh1, wTh2, oTh1); });
+      const obRes = [];
+      for (let ob = 0; ob <= 5; ob++) {
+        const avgSt = Math.round(pts.reduce((s, p) => s + p.st, 0) / pts.length);
+        const extra = Array.from({ length: ob }, (_, k) => {
+          const insertAt = Math.round((k + 1) * pts.length / (ob + 1));
+          return { id: pts.length + k + 1, st: avgSt, var: 25, ns: .05, type: "OB", isOB: true, obSlotIndex: insertAt };
+        });
+        const merged = [...pts];
+        extra.forEach(e => merged.splice(Math.min(e.obSlotIndex, merged.length), 0, e));
+        const reindexed = merged.map((p, i) => ({ ...p, id: i + 1 }));
+        const r = runMC(reindexed, "SPT", slot, T, cw, ci, co, hybW, dist, servers, walkIn, Math.min(nRuns, 300), wTh1, wTh2, oTh1);
+        obRes.push({ ob: `+${ob}`, toplam: reindexed.length, gelen: Math.round(r.avgAtt * 10) / 10, bekleme: Math.round(r.avgWait * 10) / 10, mesai: Math.round(r.avgOT * 10) / 10, maliyet: Math.round(r.avgCost), kapasite: Math.round(r.avgUtil * 100) });
+      }
+      const scen = Array.from({ length: 8 }, (_, i) => {
+        const n = 6 + i * 2;
+        const sub = Array.from({ length: n }, (_, j) => ({ ...pts[j % pts.length], id: j + 1 }));
+        const r = runMC(sub, "SPT", slot, T, cw, ci, co, hybW, dist, servers, walkIn, Math.min(nRuns, 200), wTh1, wTh2, oTh1);
+        return { n, ort: Math.round(r.avgCost), p90: Math.round(r.p90Cost), bekleme: Math.round(r.avgWait * 10) / 10, mesai: Math.round(r.avgOT * 10) / 10 };
+      });
+      if (id === mcRef.current) { setMcData({ mc: m, obRes, scen }); setMcRunning(false); }
+    }, 50);
+  }, [pts, slot, T, cw, ci, co, hybW, dist, servers, walkIn, nRuns, wTh1, wTh2, oTh1]);
+
+  const mc = mcData?.mc;
+  const radar = useMemo(() => {
+    if (!mc) return [];
+    const ms = [{ n: "Ort. bekleme", f: r => mc[r].avgWait }, { n: "P90 bekleme", f: r => mc[r].p90Wait }, { n: "Fazla mesai", f: r => mc[r].avgOT }, { n: "Maliyet", f: r => mc[r].avgCost }, { n: "Adalet", f: r => mc[r].avgStd }];
+    return ms.map(m => { const vs = RULES.map(r => m.f(r)); const mn = Math.min(...vs), mx = Math.max(...vs), rng = mx - mn || 1; const row = { metric: m.n }; RULES.forEach(r => { row[r] = Math.round(((mx - m.f(r)) / rng) * 100); }); return row; });
+  }, [mc]);
+
+  const C = "bg-[var(--color-background-primary)] border border-[var(--color-border-tertiary)] rounded-xl p-5 mb-4";
+  const SC = "bg-[var(--color-background-secondary)] rounded-lg p-3 text-center";
+  const L = "text-xs text-[var(--color-text-secondary)] mb-1";
+  const B = "text-xl font-medium text-[var(--color-text-primary)]";
+  const NT = "rounded-lg p-3 text-sm mt-3";
+
+  const simBtn = <button onClick={runSimulation} disabled={mcRunning} className="text-xs px-4 py-2 rounded-lg border font-medium" style={{ background: mcRunning ? "var(--color-background-secondary)" : "var(--color-background-info)", color: mcRunning ? "var(--color-text-tertiary)" : "var(--color-text-info)", borderColor: "var(--color-border-info)" }}>{mcRunning ? "Hesaplaniyor..." : `Simule et (${nRuns} x ${RULES.length} kural)`}</button>;
+
+  return (
+    <div style={{ fontFamily: "var(--font-sans)", color: "var(--color-text-primary)", padding: "1rem 0" }}>
+      <div className="text-center mb-4">
+        <h1 className="text-2xl font-medium mb-1">Hasta siralama araci v4</h1>
+        <p className="text-sm text-[var(--color-text-secondary)]">Event-driven kuyruk | {dist === "lognormal" ? "Lognormal" : "Gamma"} | {servers} sunucu | saga carpik zamanlama sapmasi</p>
+      </div>
+      <div className="flex flex-wrap gap-1.5 mb-4">
+        {TABS.map((t, i) => (<button key={i} onClick={() => setTab(i)} className={`text-xs px-3 py-1.5 rounded-lg border transition-all ${tab === i ? "bg-[var(--color-background-info)] text-[var(--color-text-info)] border-[var(--color-border-info)] font-medium" : "bg-transparent text-[var(--color-text-secondary)] border-[var(--color-border-tertiary)]"}`}>{t}</button>))}
+      </div>
+
+      {tab === 0 && (<div>
+        <div className={C}>
+          <h2 className="text-lg font-medium mb-3">Sistem parametreleri</h2>
+          <div className="grid grid-cols-3 gap-4 mb-4">
+            <div><div className={L}>Sunucu — s</div><div className="flex items-center gap-2"><input type="range" min={1} max={5} value={servers} onChange={e => setServers(+e.target.value)} className="flex-1" /><span className="text-sm font-medium w-6 text-right">{servers}</span></div></div>
+            <div><div className={L}>Calisma suresi — T (dk)</div><div className="flex items-center gap-2"><input type="range" min={240} max={720} step={30} value={T} onChange={e => setT(+e.target.value)} className="flex-1" /><span className="text-sm font-medium w-10 text-right">{T}</span></div></div>
+            <div><div className={L}>Slot — d (dk)</div><div className="flex items-center gap-2"><input type="range" min={10} max={60} step={5} value={slot} onChange={e => setSlot(+e.target.value)} className="flex-1" /><span className="text-sm font-medium w-6 text-right">{slot}</span></div></div>
+          </div>
+          <div className="grid grid-cols-3 gap-4 mb-4">
+            <div><div className={L}>Dagilim</div><select value={dist} onChange={e => setDist(e.target.value)} className="w-full text-sm"><option value="lognormal">Lognormal (saga carpik)</option><option value="gamma">Gamma (saga carpik)</option></select></div>
+            <div><div className={L}>Walk-in (hasta/saat)</div><div className="flex items-center gap-2"><input type="range" min={0} max={6} value={walkIn} onChange={e => setWalkIn(+e.target.value)} className="flex-1" /><span className="text-sm font-medium w-6 text-right">{walkIn}</span></div></div>
+            <div><div className={L}>MC tekrar</div><div className="flex items-center gap-2"><input type="range" min={100} max={2000} step={100} value={nRuns} onChange={e => setNRuns(+e.target.value)} className="flex-1" /><span className="text-sm font-medium w-10 text-right">{nRuns}</span></div></div>
+          </div>
+          <div className="grid grid-cols-4 gap-4 mb-4">
+            <div><div className={L}>Profil</div><select value={preset} onChange={e => applyPreset(e.target.value)} className="w-full text-sm">{PRESETS.map(p => <option key={p.id} value={p.id}>{p.l}</option>)}</select></div>
+            <div><div className={L}>cw (bekleme)</div><input type="number" min={0} step={.5} value={cw} onChange={e => { setCw(Math.max(0, +e.target.value || 0)); setPreset("custom"); }} className="w-full" /></div>
+            <div><div className={L}>ci (bosta)</div><input type="number" min={0} step={.5} value={ci} onChange={e => { setCi(Math.max(0, +e.target.value || 0)); setPreset("custom"); }} className="w-full" /></div>
+            <div><div className={L}>co (FM)</div><input type="number" min={0} step={.5} value={co} onChange={e => { setCo(Math.max(0, +e.target.value || 0)); setPreset("custom"); }} className="w-full" /></div>
+          </div>
+          <div className="grid grid-cols-3 gap-4 mb-4">
+            <div><div className={L}>Bekleme esik 1 (dk)</div><input type="number" min={1} max={60} value={wTh1} onChange={e => setWTh1(Math.max(1, +e.target.value || 15))} className="w-full" /></div>
+            <div><div className={L}>Bekleme esik 2 (dk)</div><input type="number" min={1} max={90} value={wTh2} onChange={e => setWTh2(Math.max(wTh1 + 1, +e.target.value || 30))} className="w-full" /></div>
+            <div><div className={L}>FM esik (dk)</div><input type="number" min={1} max={60} value={oTh1} onChange={e => setOTh1(Math.max(1, +e.target.value || 15))} className="w-full" /></div>
+          </div>
+          <div className={`${NT} bg-[var(--color-background-secondary)]`} style={{ fontSize: 11, lineHeight: 1.5 }}>
+            Bekleme maliyeti: 0-{wTh1}dk arasi cw x1, {wTh1}-{wTh2}dk arasi cw x1.5, {wTh2}dk+ cw x3. FM maliyeti: 0-{oTh1}dk arasi co x1, {oTh1}dk+ co x2.
+          </div>
+        </div>
+        <div className={C}>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-medium">Hasta verileri ({pts.length})</h2>
+            <button onClick={addPt} className="text-xs px-3 py-1 rounded-lg border border-[var(--color-border-info)] text-[var(--color-text-info)]">+ Ekle</button>
+          </div>
+          <div className={`${NT} bg-[var(--color-background-warning)] text-[var(--color-text-warning)] mb-3`} style={{ fontSize: 11, lineHeight: 1.5 }}>
+            <strong>q (gelmeme):</strong> Toplam gelmeme olasiligi. Bunun %30'u onceden iptal, %70'i randevu gunu no-show olarak modellenir. Yani q=%20 girilirse %6 iptal + %14 no-show olur.
+            <br /><strong>sigma^2 (varyans):</strong> st=30dk, sigma^2=25 ise std=5dk. {dist === "lognormal" ? "Lognormal" : "Gamma"} dagilimda hizmet suresi saga carpik: cogunluk ~25-35dk, bazen ~45dk+.
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm"><thead><tr>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left w-8">#</th>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left">st</th>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left">sigma^2</th>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left">std</th>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left">q (%)</th>
+              <th className="pb-1 text-xs text-[var(--color-text-secondary)] text-left">Tip</th>
+              <th className="pb-1 w-4"></th>
+            </tr></thead><tbody>
+              {pts.map((p, i) => (<tr key={i} className="border-t border-[var(--color-border-tertiary)]">
+                <td className="py-0.5 text-xs text-[var(--color-text-secondary)]">H{p.id}</td>
+                <td className="py-0.5"><input type="number" min={1} max={120} value={p.st} onChange={e => updatePt(i, "st", e.target.value)} className="w-12 text-sm" /></td>
+                <td className="py-0.5"><input type="number" min={0} max={500} value={p.var} onChange={e => updatePt(i, "var", e.target.value)} className="w-12 text-sm" /></td>
+                <td className="py-0.5 text-xs text-[var(--color-text-tertiary)]">{Math.round(Math.sqrt(p.var) * 10) / 10}</td>
+                <td className="py-0.5"><input type="number" min={0} max={100} value={Math.round(p.ns * 100)} onChange={e => updatePt(i, "ns", e.target.value)} className="w-12 text-sm" /></td>
+                <td className="py-0.5"><select value={p.type} onChange={e => updatePt(i, "type", e.target.value)} className="text-xs py-0 px-1 rounded border border-[var(--color-border-tertiary)] bg-[var(--color-background-primary)]"><option>Yeni</option><option>Kronik</option><option>Kontrol</option></select></td>
+                <td>{pts.length > 2 && <button onClick={() => rmPt(i)} className="text-xs text-[var(--color-text-danger)]">x</button>}</td>
+              </tr>))}
+            </tbody></table>
+          </div>
+        </div>
+        <div className="text-center mb-4">{simBtn}</div>
+      </div>)}
+
+      {tab === 1 && (<div>
+        <div className="flex flex-wrap gap-2 mb-3">
+          {RULES.map(r => (<button key={r} onClick={() => setActiveRule(r)} className="text-xs px-3 py-1.5 rounded-lg border font-medium" style={{ background: activeRule === r ? COLORS[r] + "22" : "transparent", color: activeRule === r ? COLORS[r] : "var(--color-text-secondary)", borderColor: activeRule === r ? COLORS[r] : "var(--color-border-tertiary)" }}>{r}</button>))}
+        </div>
+        {activeRule === "HYB" && (<div className={C}>
+          <h3 className="text-sm font-medium mb-2">Hibrit skor: w_st x f(st) + w_var x f(var) + w_ns x f(ns)</h3>
+          <p className="text-xs text-[var(--color-text-secondary)] mb-3">Yon: +1 = dusuk deger once (minimize), -1 = yuksek deger once (maximize)</p>
+          <div className="grid grid-cols-3 gap-3">
+            {[["st", "Sure"], ["var", "Varyans"], ["ns", "No-show"]].map(([k, l]) => (<div key={k}>
+              <div className={L}>{l}: {hybW[k].toFixed(1)} (yon: {hybW[k + "Dir"] > 0 ? "min" : "max"})</div>
+              <input type="range" min={0} max={10} value={hybW[k] * 10} onChange={e => setHybW(w => ({ ...w, [k]: +e.target.value / 10 }))} className="w-full" />
+              <div className="flex gap-2 mt-1">
+                <button onClick={() => setHybW(w => ({ ...w, [k + "Dir"]: 1 }))} className={`text-xs px-2 py-0.5 rounded border ${hybW[k + "Dir"] > 0 ? "bg-[var(--color-background-info)] text-[var(--color-text-info)] border-[var(--color-border-info)]" : "border-[var(--color-border-tertiary)] text-[var(--color-text-tertiary)]"}`}>min</button>
+                <button onClick={() => setHybW(w => ({ ...w, [k + "Dir"]: -1 }))} className={`text-xs px-2 py-0.5 rounded border ${hybW[k + "Dir"] < 0 ? "bg-[var(--color-background-info)] text-[var(--color-text-info)] border-[var(--color-border-info)]" : "border-[var(--color-border-tertiary)] text-[var(--color-text-tertiary)]"}`}>max</button>
+              </div>
+            </div>))}
+          </div>
+        </div>)}
+        <div className={C}>
+          <h2 className="text-lg font-medium mb-3">{activeRule} — stokastik tek calisma (event-driven kuyruk)</h2>
+          <div className="grid grid-cols-4 gap-3 mb-3">
+            <div className={SC}><div className={L}>Ort. bekleme</div><div className={B}>{stochDemo.avgWait.toFixed(1)}<span className="text-xs ml-1">dk</span></div></div>
+            <div className={SC}><div className={L}>FM</div><div className={B}>{Math.round(stochDemo.overtime)}<span className="text-xs ml-1">dk</span></div></div>
+            <div className={SC}><div className={L}>Gelen</div><div className={B}>{stochDemo.attended}<span className="text-xs ml-1">/{pts.length}{stochDemo.walkInCount > 0 ? "+" + stochDemo.walkInCount : ""}</span></div></div>
+            <div className={SC}><div className={L}>Maliyet</div><div className={B}>{Math.round(stochDemo.cost)}</div></div>
+          </div>
+          <Gantt details={stochDemo.details} T={T} rule={activeRule} servers={servers} />
+        </div>
+        {mc && (<div className={C}>
+          <h3 className="text-sm font-medium mb-3">MC karsilastirmasi ({nRuns} tekrar)</h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={RULES.map(r => ({ rule: r, ort: Math.round(mc[r].avgWait * 10) / 10, p90: Math.round(mc[r].p90Wait * 10) / 10 }))}>
+              <XAxis dataKey="rule" tick={{ fontSize: 12 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip formatter={v => [v + " dk"]} />
+              <Bar dataKey="ort" name="Ort. bekleme" radius={[4, 4, 0, 0]}>{RULES.map(r => <Cell key={r} fill={COLORS[r]} />)}</Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>)}
+        {!mc && <div className="text-center text-sm text-[var(--color-text-secondary)] py-4">MC sonuclari icin "Simule et" butonuna basin.</div>}
+      </div>)}
+
+      {tab === 2 && (<div>
+        {mc ? (<div className={C}>
+          <h2 className="text-lg font-medium mb-3">Maliyet dagilimi ({nRuns} MC)</h2>
+          <table className="w-full text-sm"><thead><tr className="text-left border-b border-[var(--color-border-tertiary)]">
+            <th className="pb-2 text-xs text-[var(--color-text-secondary)]">Kural</th>
+            <th className="pb-2 text-xs text-center text-[var(--color-text-secondary)]">Ort.</th><th className="pb-2 text-xs text-center text-[var(--color-text-secondary)]">P50</th><th className="pb-2 text-xs text-center text-[var(--color-text-secondary)]">P90</th>
+            <th className="pb-2 text-xs text-center text-[var(--color-text-secondary)]">Gelen</th><th className="pb-2 text-xs text-center text-[var(--color-text-secondary)]">Kapasite</th>
+          </tr></thead><tbody>{RULES.map(r => (<tr key={r} className="border-b border-[var(--color-border-tertiary)]">
+            <td className="py-2 text-xs font-medium" style={{ color: COLORS[r] }}>{r}</td>
+            <td className="py-2 text-xs text-center">{Math.round(mc[r].avgCost)}</td><td className="py-2 text-xs text-center">{Math.round(mc[r].p50Cost)}</td><td className="py-2 text-xs text-center font-medium">{Math.round(mc[r].p90Cost)}</td>
+            <td className="py-2 text-xs text-center">{mc[r].avgAtt.toFixed(1)}/{pts.length}</td><td className="py-2 text-xs text-center">{(mc[r].avgUtil * 100).toFixed(0)}%</td>
+          </tr>))}</tbody></table>
+        </div>) : <div className="text-center text-sm text-[var(--color-text-secondary)] py-8">{simBtn}</div>}
+      </div>)}
+
+      {tab === 3 && (<div>
+        {mcData?.obRes ? (<div className={C}>
+          <h2 className="text-lg font-medium mb-2">Dinamik overbooking — gune yayilmis ekleme</h2>
+          <p className="text-xs text-[var(--color-text-secondary)] mb-3">OB hastalar listenin sonuna degil, esit aralikla gun icine dagilarak eklenir. Her senaryo MC ile simule edilir.</p>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={mcData.obRes}><XAxis dataKey="ob" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip />
+              <Bar dataKey="maliyet" name="Maliyet" fill="#7F77DD" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+          <table className="w-full text-sm mt-3"><thead><tr className="text-left border-b border-[var(--color-border-tertiary)]">
+            <th className="pb-1 text-xs text-[var(--color-text-secondary)]">OB</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">Toplam</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">Gelen</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">Bekleme</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">FM</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">Maliyet</th><th className="pb-1 text-xs text-center text-[var(--color-text-secondary)]">Kap.</th>
+          </tr></thead><tbody>{mcData.obRes.map((d, i) => (<tr key={i} className="border-b border-[var(--color-border-tertiary)]">
+            <td className="py-1 text-xs font-medium">{d.ob}</td><td className="py-1 text-xs text-center">{d.toplam}</td><td className="py-1 text-xs text-center">{d.gelen}</td><td className="py-1 text-xs text-center">{d.bekleme}dk</td><td className="py-1 text-xs text-center">{d.mesai}dk</td><td className="py-1 text-xs text-center">{d.maliyet}</td><td className="py-1 text-xs text-center">{d.kapasite}%</td>
+          </tr>))}</tbody></table>
+        </div>) : <div className="text-center text-sm text-[var(--color-text-secondary)] py-8">{simBtn}</div>}
+      </div>)}
+
+      {tab === 4 && (<div>
+        {mc ? (<><div className={C}>
+          <h2 className="text-lg font-medium mb-3">Pareto — hicbir kural mutlak en iyi degildir</h2>
+          <ResponsiveContainer width="100%" height={300}><RadarChart data={radar}><PolarGrid stroke="var(--color-border-tertiary)" /><PolarAngleAxis dataKey="metric" tick={{ fontSize: 11 }} /><PolarRadiusAxis tick={{ fontSize: 10 }} domain={[0, 100]} />
+            {RULES.map(r => <Radar key={r} name={r} dataKey={r} stroke={COLORS[r]} fill={COLORS[r]} fillOpacity={.08} strokeWidth={2} />)}<Legend iconSize={10} wrapperStyle={{ fontSize: 12 }} />
+          </RadarChart></ResponsiveContainer>
+        </div>
+        <div className={C}>
+          <h3 className="text-sm font-medium mb-3">Detay</h3>
+          <table className="w-full text-sm"><thead><tr className="text-left border-b border-[var(--color-border-tertiary)]"><th className="pb-2 text-xs text-[var(--color-text-secondary)]">Metrik</th>{RULES.map(r => <th key={r} className="pb-2 text-xs text-center" style={{ color: COLORS[r] }}>{r}</th>)}</tr></thead><tbody>
+            {[["Ort. bekleme", r => mc[r].avgWait.toFixed(1)], ["P90 bekleme", r => mc[r].p90Wait.toFixed(1)], ["Ort. FM", r => mc[r].avgOT.toFixed(1)], ["P90 FM", r => mc[r].p90OT.toFixed(1)], ["Kapasite", r => (mc[r].avgUtil * 100).toFixed(0) + "%"], ["Gelen", r => mc[r].avgAtt.toFixed(1)], ["Walk-in", r => mc[r].avgWI.toFixed(1)], ["Ort. maliyet", r => Math.round(mc[r].avgCost)], ["P90 maliyet", r => Math.round(mc[r].p90Cost)], ["Adalet", r => mc[r].avgStd.toFixed(1)]].map(([n, f], i) => (
+              <tr key={i} className="border-b border-[var(--color-border-tertiary)]"><td className="py-1 text-xs">{n}</td>{RULES.map(r => <td key={r} className="py-1 text-center text-xs">{f(r)}</td>)}</tr>
+            ))}
+          </tbody></table>
+        </div></>) : <div className="text-center text-sm text-[var(--color-text-secondary)] py-8">{simBtn}</div>}
+      </div>)}
+
+      {tab === 5 && (<div>
+        {mcData?.scen ? (<><div className={C}>
+          <h2 className="text-lg font-medium mb-2">Duyarlilik — gercek veriden bootstrap</h2>
+          <ResponsiveContainer width="100%" height={240}><BarChart data={mcData.scen}><XAxis dataKey="n" tick={{ fontSize: 11 }} /><YAxis tick={{ fontSize: 11 }} /><Tooltip />
+            <Bar dataKey="ort" name="Ort. maliyet" fill="#7F77DD" radius={[4, 4, 0, 0]} /><Bar dataKey="p90" name="P90 maliyet" fill="#D4537E" radius={[4, 4, 0, 0]} />
+          </BarChart></ResponsiveContainer>
+        </div>
+        <div className={C}>
+          <ResponsiveContainer width="100%" height={200}><LineChart data={mcData.scen}><CartesianGrid strokeDasharray="3 3" opacity={.2} /><XAxis dataKey="n" tick={{ fontSize: 11 }} /><YAxis yAxisId="l" tick={{ fontSize: 11 }} /><YAxis yAxisId="r" orientation="right" tick={{ fontSize: 11 }} /><Tooltip /><Legend iconSize={10} wrapperStyle={{ fontSize: 12 }} />
+            <Line yAxisId="l" type="monotone" dataKey="bekleme" name="Bekleme (dk)" stroke="#378ADD" strokeWidth={2} /><Line yAxisId="r" type="monotone" dataKey="mesai" name="FM (dk)" stroke="#D85A30" strokeWidth={2} />
+          </LineChart></ResponsiveContainer>
+        </div></>) : <div className="text-center text-sm text-[var(--color-text-secondary)] py-8">{simBtn}</div>}
+      </div>)}
+
+      {tab === 6 && (<div className={C}>
+        <h2 className="text-lg font-medium mb-4">Kisaltmalar — TR / EN</h2>
+        <table className="w-full text-sm"><thead><tr className="text-left border-b border-[var(--color-border-tertiary)]"><th className="pb-2 text-xs text-[var(--color-text-secondary)] w-16">Kisaltma</th><th className="pb-2 text-xs text-[var(--color-text-secondary)]">Turkce</th><th className="pb-2 text-xs text-[var(--color-text-secondary)]">English</th></tr></thead>
+        <tbody>{GLOSSARY.map((g, i) => (<tr key={i} className="border-b border-[var(--color-border-tertiary)]"><td className="py-1.5 text-xs font-medium text-[var(--color-text-info)]">{g.k}</td><td className="py-1.5 text-xs">{g.t}</td><td className="py-1.5 text-xs text-[var(--color-text-secondary)]">{g.e}</td></tr>))}</tbody></table>
+      </div>)}
+
+      {tab === 7 && (<div>
+        <div className={C}>
+          <h2 className="text-lg font-medium mb-4">v4 degisiklik ve sinirliliklar</h2>
+          <div className="text-sm" style={{ lineHeight: 1.8 }}>
+            {[
+              { d: "v4", t: "Event-driven kuyruk (kritik duzeltme)", a: "Walk-in ve randevulu hastalar varis zamanina gore birlestirilerek tek kronolojik kuyrukta islenir. v3'teki 'once randevulu, sonra walk-in' hatasi giderildi." },
+              { d: "v4", t: "Iptal/no-show ayristirmasi (kritik duzeltme)", a: "Toplam gelmeme = q. Bunun %30'u onceden iptal, %70'i no-show. Iki bagimsiz Bernoulli cekimi yerine tek cekim + alt kirilim. q=%20 girilirse tam %20 gelmeme orani korunur." },
+              { d: "v4", t: "HYB skor yonu", a: "Her boyut icin min/max yonu secimi eklendi. +1 = dusuk deger once (SPT mantigi), -1 = yuksek deger once (LPT mantigi)." },
+              { d: "v4", t: "Debounced MC hesaplama", a: "Her input degisikliginde otomatik 3000 simulasyon tetiklenmez. 'Simule et' butonu ile kullanici kontrolunde calistirilir. UI donmasi onlenir." },
+              { d: "v4", t: "Gune yayilmis overbooking", a: "OB hastalar listenin sonuna degil, esit aralikla gun icine dagilarak eklenir. Idle time optimizasyonu test edilir." },
+              { d: "v4", t: "Parametrik maliyet esikleri", a: "Bekleme esik 1/2 ve FM esigi kullanici tarafindan ayarlanabilir. Hardcoded 15/30/15 degerleri kaldirildi." },
+              { d: "v4", t: "Saga carpik zamanlama sapmasi", a: "Uniform +-5dk yerine saga carpik dagilim: cogunluk zamaninda veya hafif erken, bazen belirgin gec. Gercek hasta davranisina daha uygun." },
+              { d: "v4", t: "serverEnd optimizasyonu", a: "indexOf(Math.min(...)) yerine for dongusu ile O(S) minimize edildi. Pratikte ayni, ama daha temiz." },
+              { d: "snr", t: "Preemptive oncelik", a: "Acil hasta mevcut hizmeti kesemez. Sadece non-preemptive kuyruk." },
+              { d: "snr", t: "Cok odali kaynak yapisi", a: "Farkli odalar, kaynak paylasimi modellenmez. Mimari degisiklik gerektirir." },
+              { d: "snr", t: "Personel heterojenligi", a: "Tum sunucular ayni hizda. Yetkinlik/vardiya kisiti yok." },
+              { d: "snr", t: "Dinamik yeniden planlama", a: "Iptal/no-show sonrasi bos slota baska hasta atanmaz." },
+              { d: "snr", t: "Hasta davranisi/tercihi", a: "Memnuniyet, tercih fonksiyonu, ikinci randevu talebi modellenmez." },
+              { d: "snr", t: "Web Worker", a: "MC hala ana thread'de calisir. Cok buyuk simulasyonlarda (2000+ tekrar, 20+ hasta) donma riski vardir. Web Worker entegrasyonu gelecek surumde planlanabilir." },
+            ].map((item, i) => (
+              <div key={i} style={{ display: "flex", gap: 10, marginBottom: 10, paddingBottom: 10, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                <span className="text-xs font-medium px-2 py-0.5 rounded shrink-0 h-fit" style={{ background: item.d === "v4" ? "var(--color-background-success)" : "var(--color-background-danger)", color: item.d === "v4" ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{item.d === "v4" ? "v4 duzeltildi" : "sinirlilik"}</span>
+                <div><div className="text-sm font-medium">{item.t}</div><div className="text-xs text-[var(--color-text-secondary)]" style={{ marginTop: 2 }}>{item.a}</div></div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="rounded-lg p-3 text-sm bg-[var(--color-background-warning)] text-[var(--color-text-warning)]" style={{ lineHeight: 1.7 }}>
+          Bu arac, politika karsilastirmasina hizmet eden deneysel bir simulasyon aracidir. Dogrudan kurum gercekligini tahmin eden nihai cozum olarak kullanilmamalidir. Sonuclar parametre secimlerine ve stokastik varyasyona baglidir. Klinik kararlarda uzman degerlendirmesiyle birlikte kullanilmalidir.
+        </div>
+      </div>)}
+    </div>
+  );
+}
